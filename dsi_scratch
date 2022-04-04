@@ -1,0 +1,109 @@
+#!/bin/bash
+
+# This script built on the DSIStudio and FSL toolboxes is adapted from the HCP-A study Processing Scripts
+
+rawdata=<path to raw data>
+bvecs=<path to vector textfile>
+bvals=<path to bval textfile>
+outdir=<fullpath to /derivatives/dmriprepro>
+subjects=cat(``) # path to my subjects file
+
+for $s in subjects
+
+do
+mkdir $outdir/sub-${s}
+
+###### Correct distortions caused by magnetic field inhomogeneities with FSL's topup utility ######
+# create the file “AP_PA.nii.gz”
+fslmerge -t $outdir/sub-${s}/AP_PA <AP spin echo fmap>.nii.gz <PA spin echo fieldmap>.nii.gz
+
+# Create the acquisition parameters file. The first 3 numbers in each row indicate phase-encoding (x-, y-, z-dimensions).
+# The last number=read-out time, in milliseconds.
+# Extract this from the “TotalReadOutTime” field of the spin echo .json file.
+# You should have one row for each volume in your merged file.
+
+touch $outdir/sub-${s}/acq_params.txt
+echo 0 1 0 <read out value> > $outdir/sub-${s}/acq_params.txt # AP encoding
+echo 0 1 0 <read out value> >> $outdir/sub-${s}/acq_params.txt 
+echo 0 -1 0 <read out value> >> $outdir/sub-${s}/acq_params.txt # PA encoding
+echo 0 -1 0 <read out value> >> $outdir/sub-${s}/acq_params.txt
+
+# Run topup. Output is AP_PA_topup_fieldcoef.nii.gz
+topup --imain=AP_PA.nii.gz --datain=acq_param.txt --config=b02b0.cnf --out=AP_PA_topup
+
+# Apply correction. The inindex should correspond to lines ofacq_param.txt from the same phase-encoding direction. 
+applytopup --imain=sub-${s}*-AP_dwi.nii.gz \
+--inindex=1,2 --datain=acq_param.txt \
+--topup=AP_PA_topup --method=jac \
+--verbose --out=$outdir/sub-${s}_AP_top
+
+applytopup --imain=sub-${s}*-PA_dwi.nii.gz \
+--inindex=3,4 --datain=acq_param.txt \
+--topup=AP_PA_topup --method=jac \
+--verbose --out=$outdir/sub-${s}_PA_top
+
+###### Correct eddy current distortions with FSL's eddy utility ######
+# Create a brain mask based on the first image from each topup corrected dataset. 
+fslroi $outdir/sub-${s}_AP_top.nii.gz AP_1stVol 0 1
+bet AP_1stVol.nii.gz AP_brain -m -f 0.2
+
+# Write the index file 
+for i in {1..,<# of subfiles in .nii.gz>}; do echo "1" >> AP_index.txt; done
+for i in {1..,<# of subfiles in .nii.gz>}; do echo "1" >> PA_index.txt; done
+
+# Info about the options live here:
+# https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/eddy/UsersGuide#A--index
+# see link for directions for formatting sliceinfo.txt
+
+eddy --imain=sub-${s}*-AP_dwi.nii.gz \
+--mask=AP_brain_mask.nii.gz \
+--index=index.txt \
+--acqp=acq_param.txt \
+--bvecs=*_acq-AP_dwi.bvec \
+--bvals=*_acq-AP_dwi.bval \
+--fwhm=2,1,0,0,0 \
+--topup=AP_PA_topup \
+--out=AP_eddycorrected \
+--repol --mb=4\	    #parameters for outliers
+--mporder=<#dir/2,3, or 4 (need an integer)> --slspec=<path to sliceinfo.txt> \ # intravolume
+--estimate_move_by_susceptibility \
+--verbose
+
+###### Run QUAD (QUality Assessment for DMRI) ######
+# This tool generates single subject reports and stores the quality
+# assessment indices for each subject:https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/eddyqc/UsersGuide
+# eddy_quad <eddy_output_basename> -idx <eddy_index_file> -par <eddy_acqparams_file> -m <nodif_mask> -b <bvals>
+eddy_quad AP_eddyqc \
+--eddyIdx=index.txt \
+--eddyParams=acq_param.txt \
+--mask=AP_brain_mask.nii.gz \
+--bvals=*_acq-AP_dwi.bval \
+--field=AP_PA_topup \
+--bvecs=*_acq-AP_dwi.bvec \
+--slspec=<path to sliceinfo.txt> \
+--output-dir=<output folder> \
+--verbose
+
+# Step 1: generate SRC files from multiple NIFTI files. If dsistudio
+# files to find bval and bvecs (should also be in rawdata) you may
+# need to add --bval and --bvec flags.
+
+# Find all *_AP.nii.gz file and combine its corresponding *_PA.nii.gz
+# file to generate one combined SRC file from preprocessed data.
+# Help: https://dsi-studio.labsolver.org/doc/cli_t1.html
+    
+    dsi_studio --action=src --source=*_AP.nii.gz --other_source=*_PA.nii.gz --output=$outdir/sub-${s}
+done
+
+
+
+
+
+#SBATCH -t 24:00:00
+#SBATCH -p 
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 8
+#SBATCH --mem=15GB
+#SBATCH --array=0-999
+#set -x
+#sh $1 $SLURM_ARRAY_TASK_ID
